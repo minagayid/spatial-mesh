@@ -4,9 +4,6 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
-import numpy as np
-
-from .spaxel import Spaxel
 from .space_tensor import SpaceTensor
 from .environment import EnvironmentObject
 from .raycasting import raycast
@@ -25,10 +22,12 @@ _REFLECTIVITY = {
 
 
 class World:
-    def __init__(self, bounds=((-3.0, -3.0, 0.0), (3.0, 3.0, 2.5)), cell_size=0.1):
+    def __init__(self, bounds=((-3.0, -3.0, 0.0), (3.0, 3.0, 2.5)), cell_size=0.1, eager=False):
         self.bounds = tuple(tuple(float(v) for v in b) for b in bounds)
         self.cell_size = float(cell_size)
-        self.tensor = SpaceTensor(bounds=self.bounds, cell_size=self.cell_size)
+        if self.cell_size <= 0.0:
+            raise ValueError("cell_size must be positive")
+        self.tensor = SpaceTensor(bounds=self.bounds, cell_size=self.cell_size, eager=eager)
         self.objects: List[EnvironmentObject] = []
 
     def add_object(self, obj: EnvironmentObject) -> None:
@@ -38,6 +37,7 @@ class World:
         self.objects.extend(objects)
 
     def build(self) -> None:
+        self.tensor.reset()
         for obj in self.objects:
             for idx in obj.voxel_indices(self.tensor):
                 obs = {
@@ -46,6 +46,7 @@ class World:
                     "confidence": 1.0,
                     "material": obj.material or obj.kind,
                     "object_id": obj.id,
+                    "object_type": obj.kind,
                     "timestamp": float(obj.id),
                 }
                 if obj.temperature:

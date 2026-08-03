@@ -8,6 +8,8 @@ from .scene_graph import SpatialSceneGraph
 from .semos import SpaceOperatingSystem
 from .navigation import AStarNavigation
 from .sensors import SensorSuite
+from .fusion import Observation, OccupancyFusion
+from .mesh import SpatialMesh
 
 __all__ = [
     "Spaxel",
@@ -22,4 +24,7 @@ __all__ = [
     "SpaceOperatingSystem",
     "AStarNavigation",
     "SensorSuite",
+    "Observation",
+    "OccupancyFusion",
+    "SpatialMesh",
 ]

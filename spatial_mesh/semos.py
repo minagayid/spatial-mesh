@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .spaxel import Spaxel
 from .space_tensor import SpaceTensor
@@ -22,34 +20,23 @@ class SemanticCluster:
         self.spaxels: List[Spaxel] = []
         self.velocity = (0.0, 0.0, 0.0)
         self.timestamps: List[float] = []
+        self._velocity_sum = [0.0, 0.0, 0.0]
 
     def add_spaxel(self, spaxel):
+        if len(self.spaxels) >= _CLUSTER_MAX_POINTS:
+            return
         self.spaxels.append(spaxel)
         if spaxel.timestamp:
             self.timestamps.append(spaxel.timestamp)
-        vx, vy, vz = spaxel.velocity
-        if vx or vy or vz:
-            self.velocity = (self.velocity[0] + vx, self.velocity[1] + vy, self.velocity[2] + vz)
+        for axis, value in enumerate(spaxel.velocity):
+            self._velocity_sum[axis] += value
+        count = float(len(self.spaxels))
+        self.velocity = tuple(value / count for value in self._velocity_sum)
 
     def predict_position(self, seconds=1.0):
+        seconds = float(seconds)
         vx, vy, vz = self.velocity
         return (self.position[0] + vx * seconds, self.position[1] + vy * seconds, self.position[2] + vz * seconds)
-
-
-def _dbscan_1d(values, half_width):
-    if not values:
-        return []
-    centers = []
-    spans = []
-    start = values[0]
-    for val in values[1:]:
-        if val - start > half_width * 2:
-            centers.append((start + val) / 2.0)
-            spans.append((start, val))
-            start = val
-    centers.append((start + values[-1]) / 2.0)
-    spans.append((start, values[-1]))
-    return list(zip(centers, spans))
 
 
 class _Clusterer:
@@ -58,61 +45,79 @@ class _Clusterer:
         self.axis_half = float(axis_cluster_half_width)
 
     def cluster(self, occupied):
-        x_coords, y_coords, z_coords, entries = [], [], [], []
-        for idx, cell in occupied:
-            ix, iy, iz = idx
-            cx = float(cell.x)
-            cy = float(cell.y)
-            cz = float(cell.z)
-            x_coords.append(cx)
-            y_coords.append(cy)
-            z_coords.append(cz)
-            entries.append((idx, cell, (cx, cy, cz)))
-        x_groups = _dbscan_1d(sorted(x_coords), self.axis_half)
-        y_groups = _dbscan_1d(sorted(y_coords), self.axis_half)
-        z_groups = _dbscan_1d(sorted(z_coords), self.axis_half)
-        centroids = [(xr[0], yr[0], zr[0]) for xr in x_groups for yr in y_groups for zr in z_groups]
-        clusters = [SemanticCluster(f"cluster-{i}", "unknown", c, (self.axis_half * 2, self.axis_half * 2, self.axis_half * 2), 0.5) for i, c in enumerate(centroids)]
-        for idx, cell, pos in entries:
-            for cluster in clusters:
-                if max(abs(a - b) for a, b in zip(pos, cluster.position)) <= self.axis_half * 1.5:
-                    cluster.add_spaxel(cell.to_spaxel())
-                    break
-        out = []
-        for cluster in clusters:
-            if not cluster.spaxels:
+        entries = list(occupied)
+        if not entries:
+            return []
+        indexed = {idx: (idx, cell) for idx, cell in entries}
+        groups: List[List[Tuple[Tuple[int, int, int], object]]] = []
+        by_object: Dict[int, List[Tuple[Tuple[int, int, int], object]]] = {}
+        unknown: Dict[Tuple[int, int, int], Tuple[Tuple[int, int, int], object]] = {}
+        for entry in entries:
+            idx, cell = entry
+            if cell.object_id:
+                by_object.setdefault(cell.object_id, []).append(entry)
+            else:
+                unknown[idx] = entry
+        groups.extend(by_object[key] for key in sorted(by_object))
+
+        # Connected components prevent the old Cartesian-product cluster
+        # explosion when objects share x/y/z projections.
+        while unknown:
+            start = next(iter(unknown))
+            queue = [start]
+            group = []
+            del unknown[start]
+            while queue:
+                current = queue.pop()
+                group.append(indexed[current])
+                cx, cy, cz = current
+                adjacent = [idx for idx in unknown if max(abs(idx[0] - cx), abs(idx[1] - cy), abs(idx[2] - cz)) <= 1]
+                for idx in adjacent:
+                    del unknown[idx]
+                    queue.append(idx)
+            groups.append(group)
+
+        clusters = []
+        for index, group in enumerate(groups):
+            points = [cell.to_spaxel() for _, cell in group[:_CLUSTER_MAX_POINTS]]
+            if not points:
                 continue
-            xs = sorted(s.x for s in cluster.spaxels)
-            ys = sorted(s.y for s in cluster.spaxels)
-            zs = sorted(s.z for s in cluster.spaxels)
+            xs = [s.x for s in points]
+            ys = [s.y for s in points]
+            zs = [s.z for s in points]
+            cluster = SemanticCluster(
+                f"cluster-{index}",
+                "unknown",
+                ((min(xs) + max(xs)) / 2.0, (min(ys) + max(ys)) / 2.0, (min(zs) + max(zs)) / 2.0),
+                (max(max(xs) - min(xs), self.voxel_size), max(max(ys) - min(ys), self.voxel_size), max(max(zs) - min(zs), self.voxel_size)),
+                min(1.0, 0.4 + 0.02 * len(points)),
+            )
+            for point in points:
+                cluster.add_spaxel(point)
             cluster.label = self._label_from(cluster)
             cluster.object_type = cluster.label
-            cluster.position = ((xs[0] + xs[-1]) / 2.0, (ys[0] + ys[-1]) / 2.0, (zs[0] + zs[-1]) / 2.0)
-            cluster.size = (
-                max(xs[-1] - xs[0], self.voxel_size),
-                max(ys[-1] - ys[0], self.voxel_size),
-                max(zs[-1] - zs[0], self.voxel_size),
-            )
-            cluster.confidence = min(1.0, 0.4 + 0.02 * len(cluster.spaxels))
-            out.append(cluster)
-        return out
+            clusters.append(cluster)
+        return clusters
 
     def _label_from(self, cluster):
-        material_vote = {}
-        motion_count = 0
-        avg_temp = 0.0
-        for s in cluster.spaxels:
-            if s.material:
-                material_vote[s.material] = material_vote.get(s.material, 0) + 1
-            motion_count += s.motion
-            avg_temp += s.temperature
-        if motion_count / max(len(cluster.spaxels), 1) > 0.35:
+        type_vote: Dict[str, int] = {}
+        material_vote: Dict[str, int] = {}
+        motion = 0.0
+        temperature = 0.0
+        for spaxel in cluster.spaxels:
+            if spaxel.object_type:
+                type_vote[spaxel.object_type] = type_vote.get(spaxel.object_type, 0) + 1
+            if spaxel.material:
+                material_vote[spaxel.material] = material_vote.get(spaxel.material, 0) + 1
+            motion += spaxel.motion
+            temperature += spaxel.temperature
+        if type_vote:
+            return max(type_vote, key=type_vote.get)
+        if motion / max(len(cluster.spaxels), 1) > 0.35:
             return "human"
         if material_vote:
-            mat = max(material_vote, key=material_vote.get)
-            if mat in {"wood", "metal", "glass", "plastic", "fabric"}:
-                return mat
-        if abs(avg_temp) > 2.5:
+            return max(material_vote, key=material_vote.get)
+        if abs(temperature) / max(len(cluster.spaxels), 1) > 2.5:
             return "human_or_animal"
         return "object"
 
@@ -132,13 +137,17 @@ class SpaceOperatingSystem:
 
     def ingest(self, tensor):
         self.world_model = tensor
+        self.last_frame_objects = list(self.current_objects)
+        self.scene.clear()
         occupied = list(tensor.occupied_cells())
         if not occupied:
+            self._last_clusters = []
             self.current_objects = []
             return self.current_objects
         clusters = self.clusterer.cluster(occupied)
         self._last_clusters = list(clusters)
         scene_nodes: List[SceneNode] = []
+        cluster_node_ids = {}
         for cluster in clusters:
             node_id = self.scene.add_object(
                 cluster.label,
@@ -149,26 +158,23 @@ class SpaceOperatingSystem:
                 metadata={"velocity": cluster.velocity},
                 spaxels=cluster.spaxels,
             )
-            scene_nodes.append(SceneNode(node_id, cluster.label, cluster.position, cluster.size, cluster.object_type, cluster.confidence))
-        self._infer_relations(clusters, scene_nodes)
-        self.last_frame_objects = self.current_objects
+            cluster_node_ids[id(cluster)] = node_id
+            scene_nodes.append(self.scene.nodes[node_id])
+        self._infer_relations(clusters, cluster_node_ids)
         self.current_objects = scene_nodes
         return self.current_objects
 
     def predict(self, seconds=1.0):
-        if not self.current_objects:
-            return []
-        return [cluster.predict_position(seconds) for cluster in getattr(self, "_last_clusters", [])]
+        return [cluster.predict_position(seconds) for cluster in self._last_clusters]
 
-    def _infer_relations(self, clusters, scene_nodes):
+    def _infer_relations(self, clusters, cluster_node_ids):
         supports = [cluster for cluster in clusters if cluster.object_type in {"table", "shelf"}]
         on_top = [cluster for cluster in clusters if cluster.object_type in {"cup", "book", "object"}]
         for lower in supports:
-            lower_id = lower.label
             for upper in on_top:
                 if lower is upper:
                     continue
                 same_xy = abs(lower.position[0] - upper.position[0]) < lower.size[0] and abs(lower.position[1] - upper.position[1]) < lower.size[1]
                 vertical_stack = upper.position[2] > lower.position[2]
                 if same_xy and vertical_stack:
-                    self.scene.relate(lower_id, upper.label, "ON")
+                    self.scene.relate(cluster_node_ids[id(lower)], cluster_node_ids[id(upper)], "ON")

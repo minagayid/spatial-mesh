@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
-
-import numpy as np
+import math
 
 
 @dataclass
@@ -44,14 +43,16 @@ class SensorSuite:
         kinds = tuple(self.sensor_types) or ("ultrasound",)
         for kind in kinds:
             max_range = self._max_range.get(kind, 20.0)
-            for az in np.linspace(-np.pi / 2, np.pi / 2, azimuth_steps):
-                for el in np.linspace(-np.pi / 6, np.pi / 6, elevation_steps):
-                    direction = np.array([
-                        np.cos(el) * np.cos(az),
-                        np.cos(el) * np.sin(az),
-                        np.sin(el),
-                    ], dtype=float)
-                    samples = world.raycast(self.origin, tuple(direction), max_range=max_range)
+            for az_index in range(max(1, azimuth_steps)):
+                az = -math.pi / 2 + (math.pi * az_index / max(1, azimuth_steps - 1)) if azimuth_steps > 1 else 0.0
+                for el_index in range(max(1, elevation_steps)):
+                    el = -math.pi / 6 + (math.pi / 3 * el_index / max(1, elevation_steps - 1)) if elevation_steps > 1 else 0.0
+                    direction = (
+                        math.cos(el) * math.cos(az),
+                        math.cos(el) * math.sin(az),
+                        math.sin(el),
+                    )
+                    samples = world.raycast(self.origin, direction, max_range=max_range)
                     for sample in samples:
                         obs = SensorObservation(
                             origin=self.origin,
