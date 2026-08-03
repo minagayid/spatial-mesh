@@ -6,14 +6,14 @@ build-backend = "setuptools.build_meta"
 name = "spatial_mesh"
 version = "0.1.0"
 description = "Wave-based spatiotemporal perception mesh for robot spatial intelligence."
-requires-python = ">=3.11"
-dependencies = [
-  "numpy>=1.24",
-  "matplotlib>=3.5",
-  "networkx>=2.8",
-]
+requires-python = ">=3.10"
+dependencies = []
 
 [project.optional-dependencies]
+visual = [
+  "numpy>=1.24",
+  "matplotlib>=3.5",
+]
 dev = [
   "pytest>=8.0",
 ]

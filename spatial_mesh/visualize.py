@@ -2,15 +2,21 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
-import matplotlib.pyplot as plt
-import numpy as np
+from .spaxel import Spaxel
+from .world import World
+from .environment import EnvironmentObject
+from .space_tensor import SpaceTensor
+from .semos import SpaceOperatingSystem
+from .navigation import AStarNavigation
 
-from spaxels.src.spaxel import Spaxel
-from spaxels.src.world import World
-from spaxels.src.environment import EnvironmentObject
-from spaxels.src.space_tensor import SpaceTensor
-from spaxels.src.semos import SpaceOperatingSystem
-from spaxels.src.navigation import AStarNavigation
+
+def _visual_dependencies():
+    try:
+        import matplotlib.pyplot as plt
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError("Visualization requires optional dependencies; install spatial_mesh[visual].") from exc
+    return plt, np
 
 
 def build_room(world_size=3.0, height=2.5):
@@ -38,6 +44,7 @@ def build_room(world_size=3.0, height=2.5):
 
 
 def visualize_world(world):
+    plt, np = _visual_dependencies()
     occupied = [cell for _, cell in world.tensor.occupied_cells()]
     positions = np.array([(cell.x, cell.y, cell.z) for cell in occupied])
     fig = plt.figure(figsize=(10, 8))
@@ -53,6 +60,7 @@ def visualize_world(world):
 
 
 def visualize_room_scene():
+    plt, np = _visual_dependencies()
     world = build_room()
     world.build()
     fig = plt.figure(figsize=(10, 8))
@@ -87,6 +95,7 @@ def visualize_room_scene():
 
 
 def visualize_navigation(world):
+    plt, np = _visual_dependencies()
     world.build()
     nav = AStarNavigation(world.tensor)
     half = world.bounds[0][0] + world.bounds[1][0] / 2.0
@@ -114,6 +123,7 @@ def visualize_navigation(world):
 
 
 def visualize_scene_graph(scene):
+    plt, np = _visual_dependencies()
     fig = plt.figure(figsize=(8, 6))
     ax = fig.add_subplot(111, projection="3d")
     positions = [node.position for node in scene.current_objects if node.position]

@@ -4,14 +4,12 @@ import math
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
-
-from spaxels.src.spaxel import Spaxel
-from spaxels.src.space_tensor import SpaceTensor
-from spaxels.src.world import World
-from spaxels.src.environment import EnvironmentObject
-from spaxels.src.raycasting import raycast
-from spaxels.src.semos import SpaceOperatingSystem
+from .spaxel import Spaxel
+from .space_tensor import SpaceTensor
+from .world import World
+from .environment import EnvironmentObject
+from .raycasting import raycast
+from .semos import SpaceOperatingSystem
 
 
 class WaveBasedSpaceOS:

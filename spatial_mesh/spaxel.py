@@ -3,7 +3,8 @@ from __future__ import annotations
 
 class Spaxel:
     __slots__ = ("x", "y", "z", "occupancy", "confidence", "material", "temperature",
-                 "motion", "reflectivity", "velocity", "object_id", "timestamp", "channels")
+                 "motion", "reflectivity", "velocity", "object_id", "object_type",
+                 "timestamp", "channels")
 
     def __init__(self, x: float, y: float, z: float):
         self.x = float(x)
@@ -17,6 +18,7 @@ class Spaxel:
         self.reflectivity: float = 0.0    # [0, 1]
         self.velocity: tuple[float, float, float] = (0.0, 0.0, 0.0)
         self.object_id: int = 0
+        self.object_type: str = ""
         self.timestamp: float = 0.0
         # channels align with the SpaceTensor channel spec:
         # occupancy, reflectivity, motion, velocity_x, velocity_y, velocity_z,
@@ -41,6 +43,7 @@ class Spaxel:
             "reflectivity": self.reflectivity,
             "velocity": self.velocity,
             "object_id": self.object_id,
+            "object_type": self.object_type,
             "timestamp": self.timestamp,
             "channels": list(self.channels),
         }

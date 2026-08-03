@@ -3,10 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Tuple
 
-import numpy as np
-
-from .spaxel import Spaxel
-from .space_tensor import SpaceTensor, SpaceTensorCell
+from .space_tensor import SpaceTensor
 
 
 @dataclass(frozen=True)
@@ -30,13 +27,4 @@ class EnvironmentObject:
         y_max = y0 + hy / 2.0
         z_max = z0 + hz / 2.0
         indices: list[tuple[int, int, int]] = []
-        mn, _ = tensor.bounds
-        cs = tensor.cell_size
-        for idx, cell in tensor.cells.items():
-            ix, iy, iz = idx
-            cx = mn[0] + (ix + 0.5) * cs
-            cy = mn[1] + (iy + 0.5) * cs
-            cz = mn[2] + (iz + 0.5) * cs
-            if x_min <= cx <= x_max and y_min <= cy <= y_max and z_min <= cz <= z_max:
-                indices.append(idx)
-        return indices
+        return list(tensor.iter_indices_in_aabb((x_min, y_min, z_min), (x_max, y_max, z_max)))
