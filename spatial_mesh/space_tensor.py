@@ -10,6 +10,12 @@ from .fusion import Observation, OccupancyFusion
 
 
 _OCCUPANCY_FUSION = OccupancyFusion()
+_MAX_EAGER_CELLS = 250_000
+_CHANNEL_COUNT = 9
+_MAX_DENSE_VALUES = _MAX_EAGER_CELLS * 9
+_MAX_SEEN_EVENT_IDS = 100_000
+_MAX_EVENT_ID_CHARS = 200
+_MAX_CELL_OBSERVATIONS = 2**53
 
 
 @dataclass
@@ -33,63 +39,82 @@ class SpaceTensorCell:
     last_modality: str = "unknown"
     uncertainty: float = 1.0
     observation_count: int = 0
+    occupancy_initialized: bool = False
+    initialized_channels: set[str] = field(default_factory=set)
     motion_phoniness: float = 0.0  # ponytail: retained for compatibility, unused
 
     def integrate(self, field_key: str, value: float, weight: float) -> None:
         if weight <= 0.0:
             return
-        current = float(getattr(self, field_key, 0.0))
-        if current == 0.0:
+        if field_key not in self.initialized_channels:
             setattr(self, field_key, value)
-        else:
-            blended = (1.0 - weight) * current + weight * value
-            setattr(self, field_key, blended)
-
-    def apply_observation(self, observation: Dict[str, Any]) -> None:
-        if not observation:
+            self.initialized_channels.add(field_key)
             return
-        prior_observations = self.observation_count
+        current = float(getattr(self, field_key, 0.0))
+        blended = (1.0 - weight) * current + weight * value
+        setattr(self, field_key, blended)
+
+    def apply_observation(self, observation: Dict[str, Any]) -> bool:
+        if not observation:
+            return False
+        if isinstance(self.observation_count, bool) or not isinstance(self.observation_count, int) or self.observation_count < 0:
+            raise ValueError("observation_count must be a non-negative integer")
+        if self.observation_count >= _MAX_CELL_OBSERVATIONS:
+            raise ValueError("cell observation count exceeds the supported limit")
         confidence = _clamp(observation.get("confidence", 1.0))
         uncertainty = _clamp(observation.get("uncertainty", 0.0))
         weight = min(0.9, confidence * (1.0 - uncertainty) * 0.9)
         if weight <= 0.0:
-            return
+            return False
+
+        occupancy = _clamp(observation["occupancy"]) if "occupancy" in observation else None
+        bounded_channels = {
+            key: _clamp(observation[key])
+            for key in ("reflectivity", "motion", "confidence", "material_conf")
+            if key in observation
+        }
+        temperature = float(observation["temperature"]) if "temperature" in observation else None
+        velocities = {
+            f"velocity_{axis}": float(observation[f"velocity_{axis}"])
+            for axis in ("x", "y", "z")
+            if f"velocity_{axis}" in observation
+        }
+        object_id = int(observation["object_id"]) if "object_id" in observation else None
+        timestamp = float(observation["timestamp"]) if "timestamp" in observation else None
+        modality = str(observation.get("modality", self.last_modality or "unknown"))
+        material = str(observation["material"]) if observation.get("material") else None
+        object_type = str(observation["object_type"]) if observation.get("object_type") else None
+
+        # Validate every value that could raise before mutating this cell. This
+        # keeps a failed event retryable without double-applying partial state.
+        if temperature is not None and not math.isfinite(temperature):
+            temperature = None
+        velocities = {key: value for key, value in velocities.items() if math.isfinite(value)}
+        if timestamp is not None and not math.isfinite(timestamp):
+            timestamp = None
+
         self.observation_count += 1
-        self.uncertainty = (self.uncertainty * (self.observation_count - 1) + uncertainty) / self.observation_count
-        self.last_modality = str(observation.get("modality", self.last_modality or "unknown"))
-        if "occupancy" in observation and weight > 0.0:
-            measurement = _clamp(observation["occupancy"])
-            self.occupancy = measurement if prior_observations == 0 else _OCCUPANCY_FUSION.update(
-                self.occupancy, measurement, confidence, uncertainty
-            )
-        for key in ("reflectivity", "motion", "confidence", "material_conf"):
-            if key in observation:
-                self.integrate(key, _clamp(observation[key]), weight)
-        if "temperature" in observation:
-            temperature = float(observation["temperature"])
-            if math.isfinite(temperature):
-                self.integrate("temperature", temperature, weight)
-        for axis in ("x", "y", "z"):
-            key = f"velocity_{axis}"
-            if key in observation:
-                velocity = float(observation[key])
-                if not math.isfinite(velocity):
-                    continue
-                current = float(getattr(self, key, 0.0))
-                if prior_observations == 0:
-                    setattr(self, key, velocity)
-                else:
-                    setattr(self, key, (1.0 - weight) * current + weight * velocity)
-        if "material" in observation and observation["material"]:
-            self.material = observation["material"]
-        if "object_id" in observation:
-            self.object_id = int(observation["object_id"])
-        if "object_type" in observation and observation["object_type"]:
-            self.object_type = str(observation["object_type"])
-        if "timestamp" in observation:
-            timestamp = float(observation["timestamp"])
-            if math.isfinite(timestamp):
-                self.timestamp = max(self.timestamp, timestamp)
+        self.uncertainty += (uncertainty - self.uncertainty) / self.observation_count
+        self.last_modality = modality
+        if occupancy is not None:
+            prior = self.occupancy if self.occupancy_initialized else 0.5
+            self.occupancy = _OCCUPANCY_FUSION.update(prior, occupancy, confidence, uncertainty)
+            self.occupancy_initialized = True
+        for key, value in bounded_channels.items():
+            self.integrate(key, value, weight)
+        if temperature is not None:
+            self.integrate("temperature", temperature, weight)
+        for key, velocity in velocities.items():
+            self.integrate(key, velocity, weight)
+        if material is not None:
+            self.material = material
+        if object_id is not None:
+            self.object_id = object_id
+        if object_type is not None:
+            self.object_type = object_type
+        if timestamp is not None:
+            self.timestamp = max(self.timestamp, timestamp)
+        return True
 
     def channel_vector(self) -> List[float]:
         return [
@@ -133,6 +158,10 @@ class SpaceTensor:
     seen_event_ids: set[str] = field(default_factory=set, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.eager, bool):
+            raise ValueError("eager must be a boolean")
+        if isinstance(self.channels, bool) or not isinstance(self.channels, int) or self.channels != _CHANNEL_COUNT:
+            raise ValueError(f"channels must be {_CHANNEL_COUNT} for the current cell schema")
         mn, mx = self.bounds
         if not math.isfinite(float(self.cell_size)) or self.cell_size <= 0.0:
             raise ValueError("cell_size must be positive")
@@ -143,6 +172,8 @@ class SpaceTensor:
         if any(self.max_bound[i] <= self.min_bound[i] for i in range(3)):
             raise ValueError("bounds must have increasing min and max coordinates")
         self.shape = tuple(max(1, int(math.ceil((self.max_bound[i] - self.min_bound[i]) / self.cell_size))) for i in range(3))
+        if self.eager and math.prod(self.shape) > _MAX_EAGER_CELLS:
+            raise ValueError(f"eager grid exceeds {_MAX_EAGER_CELLS} cells; use eager=False or larger cells")
         self.cells = {}
         if self.eager:
             self._init_cells()
@@ -160,24 +191,44 @@ class SpaceTensor:
                     self.cells[(ix, iy, iz)] = SpaceTensorCell(x=cx, y=cy, z=cz)
 
     def cell(self, idx: Tuple[int, int, int]) -> Optional[SpaceTensorCell]:
+        if not self.valid_index(idx):
+            return None
         return self.cells.get(idx)
 
-    def _new_cell(self, idx: Tuple[int, int, int]) -> SpaceTensorCell:
-        cell = SpaceTensorCell(
+    def _create_cell(self, idx: Tuple[int, int, int]) -> SpaceTensorCell:
+        return SpaceTensorCell(
             x=self.min_bound[0] + (idx[0] + 0.5) * self.cell_size,
             y=self.min_bound[1] + (idx[1] + 0.5) * self.cell_size,
             z=self.min_bound[2] + (idx[2] + 0.5) * self.cell_size,
         )
+
+    def _new_cell(self, idx: Tuple[int, int, int]) -> SpaceTensorCell:
+        cell = self._create_cell(idx)
         self.cells[idx] = cell
         return cell
 
     def valid_index(self, idx: Tuple[int, int, int]) -> bool:
-        return all(0 <= int(idx[i]) < self.shape[i] for i in range(3))
+        return (
+            isinstance(idx, tuple)
+            and len(idx) == 3
+            and all(
+                isinstance(value, int) and not isinstance(value, bool) and 0 <= value < self.shape[axis]
+                for axis, value in enumerate(idx)
+            )
+        )
 
     def index_of(self, position: Tuple[float, float, float]) -> Optional[Tuple[int, int, int]]:
-        if not all(math.isfinite(float(value)) for value in position):
+        if not isinstance(position, (tuple, list)) or len(position) != 3:
             return None
-        idx = tuple(int(math.floor((float(position[i]) - self.min_bound[i]) / self.cell_size)) for i in range(3))
+        try:
+            coordinates = tuple(float(value) for value in position)
+        except (OverflowError, TypeError, ValueError):
+            return None
+        if not all(math.isfinite(value) for value in coordinates):
+            return None
+        if any(coordinates[i] < self.min_bound[i] or coordinates[i] >= self.max_bound[i] for i in range(3)):
+            return None
+        idx = tuple(int(math.floor((coordinates[i] - self.min_bound[i]) / self.cell_size)) for i in range(3))
         return idx if self.valid_index(idx) else None
 
     def iter_indices_in_aabb(self, minimum, maximum) -> Iterable[Tuple[int, int, int]]:
@@ -195,21 +246,32 @@ class SpaceTensor:
                 for iz in range(starts[2], stops[2] + 1):
                     yield (ix, iy, iz)
 
-    def apply_observation(self, idx: Tuple[int, int, int], observation: Dict[str, Any]) -> None:
-        if self.valid_index(idx):
-            cell = self.cells.get(idx)
-            if cell is None:
-                cell = self._new_cell(idx)
-            cell.apply_observation(observation)
+    def apply_observation(self, idx: Tuple[int, int, int], observation: Dict[str, Any]) -> bool:
+        if not self.valid_index(idx):
+            return False
+        cell = self.cells.get(idx)
+        if cell is not None:
+            return cell.apply_observation(observation)
+        candidate = self._create_cell(idx)
+        if not candidate.apply_observation(observation):
+            return False
+        if len(self.cells) >= _MAX_EAGER_CELLS:
+            raise ValueError(f"sparse tensor exceeds {_MAX_EAGER_CELLS} allocated cells")
+        self.cells[idx] = candidate
+        return True
 
     def observe(self, observation: Observation) -> Optional[Tuple[int, int, int]]:
         idx = self.index_of(observation.position)
         if idx is None:
             return None
-        if observation.event_id:
+        event_id = observation.event_id
+        if event_id:
+            if not isinstance(event_id, str) or len(event_id) > _MAX_EVENT_ID_CHARS:
+                raise ValueError(f"event_id must be a string of at most {_MAX_EVENT_ID_CHARS} characters")
             if observation.event_id in self.seen_event_ids:
                 return idx
-            self.seen_event_ids.add(observation.event_id)
+            if len(self.seen_event_ids) >= _MAX_SEEN_EVENT_IDS:
+                raise ValueError(f"event ID history exceeds {_MAX_SEEN_EVENT_IDS} entries")
         payload: Dict[str, Any] = {
             "occupancy": observation.occupancy,
             "confidence": observation.confidence,
@@ -228,7 +290,9 @@ class SpaceTensor:
         if observation.velocity is not None:
             for axis, value in zip(("x", "y", "z"), observation.velocity):
                 payload[f"velocity_{axis}"] = value
-        self.apply_observation(idx, payload)
+        applied = self.apply_observation(idx, payload)
+        if event_id and applied:
+            self.seen_event_ids.add(event_id)
         return idx
 
     def reset(self) -> None:
@@ -252,20 +316,28 @@ class SpaceTensor:
             cell.last_modality = "unknown"
             cell.uncertainty = 1.0
             cell.observation_count = 0
+            cell.occupancy_initialized = False
+            cell.initialized_channels.clear()
         self.seen_event_ids.clear()
 
     def snapshot(self) -> Dict[str, Any]:
-        """Return a JSON-serializable deterministic snapshot of occupied cells."""
+        """Return a JSON-serializable deterministic snapshot of observed cells."""
         return {
             "schema": "spatial-mesh.tensor.v1",
             "bounds": [list(self.min_bound), list(self.max_bound)],
             "cell_size": self.cell_size,
             "channels": self.channels,
+            "eager": self.eager,
             "event_ids": sorted(self.seen_event_ids),
             "cells": [
                 {"index": list(idx), **cell.to_spaxel().as_dict(), "uncertainty": cell.uncertainty,
-                 "modality": cell.last_modality, "observation_count": cell.observation_count}
-                for idx, cell in sorted(self.occupied_cells())
+                 "modality": cell.last_modality, "observation_count": cell.observation_count,
+                 "occupancy_initialized": cell.occupancy_initialized,
+                 "initialized_channels": sorted(cell.initialized_channels)}
+                for idx, cell in sorted(
+                    (item for item in self.cells.items() if item[1].observation_count > 0),
+                    key=lambda item: item[0],
+                )
             ],
         }
 
@@ -278,12 +350,42 @@ class SpaceTensor:
         if snapshot.get("schema") != "spatial-mesh.tensor.v1":
             raise ValueError("unsupported tensor snapshot schema")
         bounds = tuple(tuple(float(v) for v in bound) for bound in snapshot["bounds"])
-        tensor = cls(bounds, float(snapshot["cell_size"]), int(snapshot.get("channels", 9)))
-        for entry in snapshot.get("cells", []):
-            idx = tuple(int(v) for v in entry["index"])
+        cell_size = float(snapshot["cell_size"])
+        channels = snapshot.get("channels", 9)
+        if "eager" not in snapshot:
+            probe = cls(bounds, cell_size, channels, eager=False)
+            eager = math.prod(probe.shape) <= _MAX_EAGER_CELLS
+        else:
+            raw_eager = snapshot["eager"]
+            if not isinstance(raw_eager, bool):
+                raise ValueError("snapshot eager must be a boolean")
+            eager = raw_eager
+        tensor = cls(bounds, cell_size, channels, eager=eager)
+        entries = snapshot.get("cells", [])
+        if not isinstance(entries, list) or len(entries) > _MAX_EAGER_CELLS:
+            raise ValueError(f"snapshot cells exceeds {_MAX_EAGER_CELLS}")
+        seen_indices = set()
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise ValueError("snapshot cell entries must be objects")
+            raw_index = entry.get("index")
+            if (
+                not isinstance(raw_index, (list, tuple))
+                or len(raw_index) != 3
+                or any(isinstance(value, bool) or not isinstance(value, int) for value in raw_index)
+            ):
+                raise ValueError("snapshot cell index must contain exactly three integers")
+            idx = tuple(raw_index)
+            if idx in seen_indices:
+                raise ValueError(f"snapshot contains duplicate cell index: {idx}")
+            seen_indices.add(idx)
             cell = tensor.cell(idx)
             if cell is None:
-                raise ValueError(f"snapshot cell index is outside tensor: {idx}")
+                if not tensor.valid_index(idx):
+                    raise ValueError(f"snapshot cell index is outside tensor: {idx}")
+                if len(tensor.cells) >= _MAX_EAGER_CELLS:
+                    raise ValueError(f"snapshot sparse cells exceed {_MAX_EAGER_CELLS}")
+                cell = tensor._new_cell(idx)
             cell.occupancy = _clamp(entry.get("occupancy", 0.0))
             cell.confidence = _clamp(entry.get("confidence", 0.0))
             cell.reflectivity = _clamp(entry.get("reflectivity", 0.0))
@@ -301,8 +403,42 @@ class SpaceTensor:
                 raise ValueError("snapshot contains a non-finite timestamp")
             cell.uncertainty = _clamp(entry.get("uncertainty", 1.0))
             cell.last_modality = str(entry.get("modality", "unknown"))
-            cell.observation_count = int(entry.get("observation_count", 0))
-        tensor.seen_event_ids.update(str(event_id) for event_id in snapshot.get("event_ids", []))
+            raw_observation_count = entry.get("observation_count", 0)
+            if (
+                isinstance(raw_observation_count, bool)
+                or not isinstance(raw_observation_count, int)
+                or raw_observation_count <= 0
+                or raw_observation_count > _MAX_CELL_OBSERVATIONS
+            ):
+                raise ValueError("snapshot observation_count must be a positive integer")
+            cell.observation_count = raw_observation_count
+            if "occupancy_initialized" in entry and not isinstance(entry["occupancy_initialized"], bool):
+                raise ValueError("snapshot occupancy_initialized must be a boolean")
+            cell.occupancy_initialized = entry.get("occupancy_initialized", cell.occupancy != 0.0)
+            saved_channels = entry.get("initialized_channels")
+            allowed_channels = {
+                "reflectivity", "motion", "confidence", "material_conf", "temperature",
+                "velocity_x", "velocity_y", "velocity_z",
+            }
+            if saved_channels is not None:
+                if not isinstance(saved_channels, list) or any(
+                    not isinstance(channel, str) or channel not in allowed_channels
+                    for channel in saved_channels
+                ):
+                    raise ValueError("snapshot initialized_channels contains invalid values")
+                cell.initialized_channels.update(saved_channels)
+            elif cell.observation_count > 0:
+                # Older snapshots did not record channel initialization state.
+                cell.initialized_channels.update({
+                    "reflectivity", "motion", "confidence", "material_conf", "temperature",
+                    "velocity_x", "velocity_y", "velocity_z",
+                })
+        event_ids = snapshot.get("event_ids", [])
+        if not isinstance(event_ids, list) or len(event_ids) > _MAX_SEEN_EVENT_IDS:
+            raise ValueError("snapshot event_ids exceeds the supported limit")
+        if any(not isinstance(event_id, str) or len(event_id) > _MAX_EVENT_ID_CHARS for event_id in event_ids):
+            raise ValueError("snapshot event_ids contains invalid values")
+        tensor.seen_event_ids.update(event_ids)
         return tensor
 
     def occupied_cells(self) -> Iterable[Tuple[Tuple[int, int, int], SpaceTensorCell]]:
@@ -315,6 +451,10 @@ class SpaceTensor:
         return (self.shape[0], self.shape[1], self.shape[2], self.channels)
 
     def empty_tensor(self) -> List[List[List[List[float]]]]:
+        if math.prod(self.shape) * self.channels > _MAX_DENSE_VALUES:
+            raise ValueError(
+                f"dense tensor exceeds {_MAX_DENSE_VALUES} values; use sparse cell access instead"
+            )
         nx, ny, nz = self.shape
         return [[[[0.0] * self.channels for _ in range(nz)] for _ in range(ny)] for _ in range(nx)]
 
