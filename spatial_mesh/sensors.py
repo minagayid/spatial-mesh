@@ -17,6 +17,7 @@ class SensorObservation:
     confidence: float = 0.9
     reflectivity: float = 0.5
     ray_power: float = 1.0
+    modality: str = "unknown"
 
 
 class SensorSuite:
@@ -61,10 +62,11 @@ class SensorSuite:
                             object_kind=sample.get("object_kind", "unknown"),
                             material=sample.get("material", ""),
                             velocity=sample.get("velocity", (0.0, 0.0, 0.0)),
-                            timestamp=float(sample.get("distance", 0.0) / 343.0),
+                            timestamp=float(sample.get("distance", 0.0) / (343.0 if kind == "ultrasound" else 299_792_458.0)),
                             confidence=self._confidence_for(sample),
                             reflectivity=sample.get("reflectivity", 0.5),
                             ray_power=sample.get("reflectivity", 0.5),
+                            modality=kind,
                         )
                         observations.append(obs)
         return observations

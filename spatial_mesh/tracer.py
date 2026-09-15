@@ -30,10 +30,31 @@ class WaveBasedSpaceOS:
         if tensor is None:
             tensor = self.world_model
         for obs in observations:
-            ix, iy, iz = self.world_to_idx((0.0, 0.0, 0.0))
-            for idx in tensor.cells:
-                tensor.apply_observation(idx, obs)
-                break
+            if not isinstance(obs, dict):
+                origin = tuple(float(value) for value in obs.origin)
+                direction = tuple(float(value) for value in obs.direction)
+                distance = float(obs.distance)
+                position = tuple(origin[axis] + direction[axis] * distance for axis in range(3))
+                observation = {
+                    "occupancy": 1.0,
+                    "confidence": obs.confidence,
+                    "uncertainty": 0.0,
+                    "reflectivity": obs.reflectivity,
+                    "material": obs.material,
+                    "object_type": obs.object_kind,
+                    "timestamp": obs.timestamp,
+                    "velocity_x": obs.velocity[0],
+                    "velocity_y": obs.velocity[1],
+                    "velocity_z": obs.velocity[2],
+                    "modality": obs.modality,
+                }
+            else:
+                position = tuple(float(value) for value in obs["position"])
+                observation = dict(obs)
+
+            idx = tensor.index_of(position)
+            if idx is not None:
+                tensor.apply_observation(idx, observation)
 
     def predict_trajectory(self, tracer):
         f = tracer.get_world_model()
